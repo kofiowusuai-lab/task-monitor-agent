@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Task Monitor - single live-updating Telegram message for long tasks.
+Task Monitor - single live-updating Telegram or WhatsApp message for long tasks.
 
 An agent calls this between meaningful steps so the user sees real-time
 progress instead of a silent typing indicator.
@@ -32,7 +32,7 @@ Usage:
       Print the current rendered text to stdout (for debugging).
 
 State lives in ~/.openclaw/task-monitors/<id>.json.
-Telegram creds come from ~/.openclaw/.env (TELEGRAM_BOT_TOKEN, TELEGRAM_USER_ID).
+Transport configuration comes from process env and optionally ~/.openclaw/.env.
 """
 
 import argparse
@@ -61,7 +61,17 @@ except Exception:  # keep the monitor working even if the resolver is missing
 
 STATE_DIR = Path.home() / ".openclaw" / "task-monitors"
 ENV_FILE = Path.home() / ".openclaw" / ".env"
+HERMES_ENV_FILE = Path.home() / ".hermes" / ".env"
 DEFAULT_LANE = "default"
+DEFAULT_TRANSPORT = "telegram"
+DEFAULT_WHATSAPP_BRIDGE_URL = "http://127.0.0.1:3000"
+try:
+    WHATSAPP_ROLLOVER_SECONDS = max(
+        30.0,
+        float(os.environ.get("HERMES_TASK_MONITOR_WHATSAPP_ROLLOVER", "840") or "840"),
+    )
+except (TypeError, ValueError):
+    WHATSAPP_ROLLOVER_SECONDS = 840.0
 
 ICONS = {
     "pending": "⏳",
@@ -96,8 +106,21 @@ STALL_THRESHOLD = 1200        # seconds; a started monitor with no progress this
 
 
 # --------------------------------------------------------------------------
-# env + telegram
+# env + transports
 # --------------------------------------------------------------------------
+
+def resolve_transport(explicit=None):
+    transport = (
+        explicit
+        or os.environ.get("HERMES_TASK_MONITOR_TRANSPORT")
+        or DEFAULT_TRANSPORT
+    ).strip().lower()
+    if transport == "auto":
+        transport = DEFAULT_TRANSPORT
+    if transport not in ("telegram", "whatsapp"):
+        sys.exit("transport must be telegram or whatsapp")
+    return transport
+
 
 def resolve_lane(explicit=None):
     """Pick the lane for a monitor: explicit arg > HERMES_MONITOR_LANE env > default.
@@ -133,16 +156,17 @@ def classify_lane(lane, title):
     return lane
 
 
-def load_env(lane=DEFAULT_LANE):
-    if not ENV_FILE.exists():
-        sys.exit(f"missing {ENV_FILE}")
+def load_env(lane=DEFAULT_LANE, transport=None):
     file_env = {}
-    for line in ENV_FILE.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+    for env_path in (ENV_FILE, HERMES_ENV_FILE):
+        if not env_path.exists():
             continue
-        k, v = line.split("=", 1)
-        file_env[k.strip()] = v.strip()
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            file_env[k.strip()] = v.strip()
     # General process/profile env still participates, but task-monitor routing
     # must obey ~/.openclaw/.env HERMES_* values so users can move monitor
     # bubbles between bots/chats without restarting their agent gateway.
@@ -156,7 +180,24 @@ def load_env(lane=DEFAULT_LANE):
     if env.get("HERMES_TASK_MONITOR_DISABLED", "").lower() in ("true", "1", "yes", "on") and not (force_env or force_file.exists()):
         sys.exit("task-monitor disabled for this Hermes profile")
 
-    # Lane-aware routing: a non-default lane resolves to its
+    transport = resolve_transport(transport)
+    if transport == "whatsapp":
+        chat = env.get("HERMES_WHATSAPP_CHAT_ID") or env.get("WHATSAPP_HOME_CHANNEL")
+        bridge_url = (
+            env.get("HERMES_WHATSAPP_BRIDGE_URL")
+            or env.get("WHATSAPP_BRIDGE_URL")
+            or DEFAULT_WHATSAPP_BRIDGE_URL
+        ).rstrip("/")
+        if not chat:
+            sys.exit("HERMES_WHATSAPP_CHAT_ID or WHATSAPP_HOME_CHANNEL missing")
+        return {
+            "transport": "whatsapp",
+            "chat": str(chat),
+            "identity": f"whatsapp:{bridge_url}",
+            "bridge_url": bridge_url,
+        }
+
+    # Lane-aware Telegram routing: a non-default lane resolves to its
     # own bot+chat via ~/.openclaw/telegram_routes.json so its bubbles land in the
     # right Telegram chat. The default lane preserves the historical fallback order.
     lane = lane or DEFAULT_LANE
@@ -170,7 +211,12 @@ def load_env(lane=DEFAULT_LANE):
         chat = env.get("HERMES_TELEGRAM_CHAT_ID") or env.get("TELEGRAM_HOME_CHANNEL") or env.get("TELEGRAM_USER_ID")
     if not token or not chat:
         sys.exit("HERMES_TELEGRAM_BOT_TOKEN/HERMES_TELEGRAM_CHAT_ID or TELEGRAM_BOT_TOKEN/TELEGRAM_HOME_CHANNEL/TELEGRAM_USER_ID missing")
-    return token, chat
+    return {
+        "transport": "telegram",
+        "chat": str(chat),
+        "identity": bot_id_of(token),
+        "token": token,
+    }
 
 
 def telegram(method, token, params):
@@ -190,6 +236,26 @@ def telegram(method, token, params):
         return {"ok": False, "description": str(e)}
 
 
+def whatsapp(endpoint, bridge_url, payload):
+    url = f"{bridge_url}/{endpoint.lstrip('/')}"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            data = json.loads(body) if body else {}
+            data["ok"] = 200 <= resp.status < 300
+            return data
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
+        return {"ok": False, "error_code": e.code, "description": body}
+    except Exception as e:
+        return {"ok": False, "description": str(e)}
+
+
 # --------------------------------------------------------------------------
 # state
 # --------------------------------------------------------------------------
@@ -199,12 +265,23 @@ def state_path(monitor_id):
 
 
 def peek_lane(monitor_id):
-    """Read just the stored lane for a monitor so later commands send through the
-    same bot/chat the monitor was created with. Defaults to the default lane."""
+    """Read the stored lane for later commands."""
     try:
         return json.loads(state_path(monitor_id).read_text()).get("lane") or DEFAULT_LANE
     except Exception:
         return DEFAULT_LANE
+
+
+def peek_transport(monitor_id):
+    """Read the stored transport, defaulting old state files to Telegram."""
+    try:
+        return json.loads(state_path(monitor_id).read_text()).get("transport") or DEFAULT_TRANSPORT
+    except Exception:
+        return DEFAULT_TRANSPORT
+
+
+def load_monitor_env(monitor_id):
+    return load_env(peek_lane(monitor_id), peek_transport(monitor_id))
 
 
 def normalize_stages(stages):
@@ -234,6 +311,10 @@ def load_state(monitor_id):
     normalize_stages(s.get("stages", []))
     s.setdefault("lanes", [])
     normalize_lanes(s["lanes"])
+    s.setdefault("transport", DEFAULT_TRANSPORT)
+    s.setdefault("message_started_at", s.get("started_at", time.time()))
+    s.setdefault("message_history", [])
+    s.setdefault("rollover_count", 0)
     return s
 
 
@@ -314,7 +395,7 @@ def find_reusable_monitor(bot_id, chat_id, task_key):
             continue
         if s.get("bot_id") != bot_id:
             continue
-        if int(s.get("chat_id", -1)) != int(chat_id):
+        if str(s.get("chat_id", "")) != str(chat_id):
             continue
         if now - s.get("started_at", 0) > REUSE_WINDOW:
             continue
@@ -430,13 +511,41 @@ def render(state):
 
 
 # --------------------------------------------------------------------------
-# telegram push
+# transport push
 # --------------------------------------------------------------------------
 
-def edit_message(token, state, text):
+def send_message(config, text):
+    if config["transport"] == "whatsapp":
+        return whatsapp(
+            "send",
+            config["bridge_url"],
+            {"chatId": config["chat"], "message": text},
+        )
+    return telegram(
+        "sendMessage",
+        config["token"],
+        {
+            "chat_id": config["chat"],
+            "text": text,
+            "disable_web_page_preview": "true",
+        },
+    )
+
+
+def edit_message(config, state, text):
+    if config["transport"] == "whatsapp":
+        return whatsapp(
+            "edit",
+            config["bridge_url"],
+            {
+                "chatId": state["chat_id"],
+                "messageId": state["message_id"],
+                "message": text,
+            },
+        )
     return telegram(
         "editMessageText",
-        token,
+        config["token"],
         {
             "chat_id": state["chat_id"],
             "message_id": state["message_id"],
@@ -446,7 +555,39 @@ def edit_message(token, state, text):
     )
 
 
-def push_update(state, token):
+def maybe_rollover(config, state, text):
+    """Move a WhatsApp monitor to a fresh card before its 15-minute edit window.
+
+    The prior card is finalized when possible. A failed final edit never blocks the
+    continuation send, because an expired WhatsApp edit window is expected.
+    """
+    if config["transport"] != "whatsapp":
+        return None
+    age = time.time() - state.get("message_started_at", state.get("started_at", time.time()))
+    if age < WHATSAPP_ROLLOVER_SECONDS:
+        return None
+
+    old_id = state.get("message_id")
+    old_text = text + "\n\n↪️ Continuing in a fresh live card"
+    old_resp = edit_message(config, state, old_text)
+    if not old_resp.get("ok"):
+        desc = old_resp.get("description", "") or ""
+        print(f"warn: WhatsApp rollover final edit failed: {desc}", file=sys.stderr)
+
+    state["rollover_count"] = int(state.get("rollover_count", 0)) + 1
+    continuation = text + f"\n\n↪️ Continuation {state['rollover_count']}"
+    resp = send_message(config, continuation)
+    if not resp.get("ok") or not resp.get("messageId"):
+        return resp
+    state.setdefault("message_history", []).append(
+        {"message_id": old_id, "ended_at": time.time()}
+    )
+    state["message_id"] = resp["messageId"]
+    state["message_started_at"] = time.time()
+    return {"ok": True, "rolled_over": True, "messageId": resp["messageId"]}
+
+
+def push_update(state, config):
     """Render and send. Used by the foreground commands (stage/detail/note/lane/
     finish) — never the cosmetic ticker — so this marks REAL progress: stamp
     last_progress_ts so footer_status knows the work is still moving."""
@@ -456,16 +597,22 @@ def push_update(state, token):
     if not state.get("closed") and (now - last) < MIN_EDIT_INTERVAL:
         time.sleep(MIN_EDIT_INTERVAL - (now - last))
     text = render(state)
-    resp = edit_message(token, state, text)
+    rollover = maybe_rollover(config, state, text)
+    if rollover and rollover.get("ok"):
+        resp = rollover
+    elif rollover and not rollover.get("ok"):
+        resp = rollover
+    else:
+        resp = edit_message(config, state, text)
     # On a Telegram throttle, wait out retry_after once and re-send so the
     # transition isn't silently dropped at a fast cadence.
-    if not resp.get("ok") and resp.get("error_code") == 429:
+    if config["transport"] == "telegram" and not resp.get("ok") and resp.get("error_code") == 429:
         _ra = (resp.get("parameters") or {}).get("retry_after", 1)
         try:
             time.sleep(min(float(_ra), 30))
         except (TypeError, ValueError):
             time.sleep(1)
-        resp = edit_message(token, state, text)
+        resp = edit_message(config, state, text)
     if not resp.get("ok"):
         desc = resp.get("description", "") or ""
         if "not modified" not in desc:
@@ -511,7 +658,7 @@ def cmd_tick(args):
     """Internal: long-running loop that re-renders the monitor every TICK_INTERVAL seconds.
     Exits cleanly when the monitor is closed, missing, or older than MAX_TICKER_LIFETIME."""
     monitor_id = args.id
-    token, _ = load_env(peek_lane(monitor_id))
+    config = load_monitor_env(monitor_id)
     last_text = None
     consecutive_errors = 0
     started = time.time()
@@ -543,11 +690,16 @@ def cmd_tick(args):
             if text == last_text:
                 continue
 
-            resp = edit_message(token, state, text)
+            rollover = maybe_rollover(config, state, text)
+            if rollover:
+                resp = rollover
+                if rollover.get("ok"):
+                    save_state(state)
+            else:
+                resp = edit_message(config, state, text)
 
-            # Telegram throttle (429): respect retry_after and re-send next loop
-            # rather than counting it as a hard error. Keeps a 1s cadence alive.
-            if not resp.get("ok") and resp.get("error_code") == 429:
+            # Telegram throttle (429): respect retry_after and re-send next loop.
+            if config["transport"] == "telegram" and not resp.get("ok") and resp.get("error_code") == 429:
                 _ra = (resp.get("parameters") or {}).get("retry_after", 1)
                 try:
                     time.sleep(min(float(_ra), 30))
@@ -581,8 +733,10 @@ def cmd_tick(args):
 def cmd_start(args):
     title = args.title or "Task"
     lane = classify_lane(resolve_lane(getattr(args, "lane", None)), title)
-    token, chat = load_env(lane)
-    bot_id = bot_id_of(token)
+    transport = resolve_transport(getattr(args, "transport", None))
+    config = load_env(lane, transport)
+    chat = config["chat"]
+    transport_identity = config["identity"]
     task_key = task_key_of(title, getattr(args, "task", None))
 
     # One user task = one monitor. If a live monitor already exists for this
@@ -591,7 +745,7 @@ def cmd_start(args):
     # belong in this one monitor. --force overrides for genuinely new work that
     # happens to share a title.
     if not getattr(args, "force", False):
-        existing = find_reusable_monitor(bot_id, chat, task_key)
+        existing = find_reusable_monitor(transport_identity, chat, task_key)
         if existing is not None:
             if not ticker_alive(existing):
                 try:
@@ -610,8 +764,9 @@ def cmd_start(args):
     monitor_id = "tm_" + secrets.token_hex(4)
     state = {
         "id": monitor_id,
-        "chat_id": int(chat),
-        "bot_id": bot_id,
+        "chat_id": str(chat),
+        "bot_id": transport_identity,
+        "transport": transport,
         "lane": lane,
         "task_key": task_key,
         "title": title,
@@ -623,23 +778,21 @@ def cmd_start(args):
         "result": None,
         "summary": None,
         "message_id": None,
+        "message_started_at": time.time(),
+        "message_history": [],
+        "rollover_count": 0,
         "last_edit_ts": 0,
         "last_progress_ts": time.time(),
         "ticker_pid": None,
     }
     text = render(state)
-    resp = telegram(
-        "sendMessage",
-        token,
-        {
-            "chat_id": chat,
-            "text": text,
-            "disable_web_page_preview": "true",
-        },
-    )
+    resp = send_message(config, text)
     if not resp.get("ok"):
         sys.exit(f"sendMessage failed: {resp}")
-    state["message_id"] = resp["result"]["message_id"]
+    if transport == "whatsapp":
+        state["message_id"] = resp["messageId"]
+    else:
+        state["message_id"] = resp["result"]["message_id"]
     save_state(state)
 
     # Spawn the background ticker so the timer keeps moving
@@ -653,7 +806,7 @@ def cmd_start(args):
 
 
 def cmd_stage(args):
-    token, _ = load_env(peek_lane(args.id))
+    config = load_monitor_env(args.id)
     status = args.status
     if status not in ICONS:
         sys.exit(f"status must be one of {list(ICONS)}")
@@ -684,7 +837,7 @@ def cmd_stage(args):
                 if stg is not found and stg["status"] == "active":
                     stg["status"] = "done"
 
-        push_update(state, token)
+        push_update(state, config)
 
 
 def cmd_lane(args):
@@ -692,7 +845,7 @@ def cmd_lane(args):
     name like cmd_stage, but tolerates a closed card (a straggler subagent's late
     update is a no-op instead of a crash) and respawns the ticker so the live
     timer keeps moving across a long fan-out."""
-    token, _ = load_env(peek_lane(args.id))
+    config = load_monitor_env(args.id)
     status = args.status
     if status not in ICONS:
         sys.exit(f"status must be one of {list(ICONS)}")
@@ -726,7 +879,7 @@ def cmd_lane(args):
             except Exception as e:
                 print(f"warn: ticker respawn failed: {e}", file=sys.stderr)
 
-        push_update(state, token)
+        push_update(state, config)
 
 
 def cmd_lanes_done(args):
@@ -746,7 +899,7 @@ def cmd_lanes_done(args):
 
 
 def cmd_detail(args):
-    token, _ = load_env(peek_lane(args.id))
+    config = load_monitor_env(args.id)
     with monitor_lock(args.id):
         state = load_state(args.id)
         if state.get("closed"):
@@ -769,21 +922,21 @@ def cmd_detail(args):
         if len(target["details"]) > MAX_DETAILS_PER_STAGE:
             target["details"] = target["details"][-MAX_DETAILS_PER_STAGE:]
 
-        push_update(state, token)
+        push_update(state, config)
 
 
 def cmd_note(args):
-    token, _ = load_env(peek_lane(args.id))
+    config = load_monitor_env(args.id)
     with monitor_lock(args.id):
         state = load_state(args.id)
         if state.get("closed"):
             sys.exit("monitor already closed")
         state.setdefault("notes", []).append(args.text)
-        push_update(state, token)
+        push_update(state, config)
 
 
 def cmd_finish(args):
-    token, _ = load_env(peek_lane(args.id))
+    config = load_monitor_env(args.id)
     with monitor_lock(args.id):
         state = load_state(args.id)
 
@@ -813,7 +966,7 @@ def cmd_finish(args):
             if lane["status"] == "pending" and result == "failed":
                 lane["status"] = "failed"
 
-        push_update(state, token)
+        push_update(state, config)
 
 
 def cmd_show(args):
@@ -833,7 +986,8 @@ def main():
     s.add_argument("title")
     s.add_argument("--stages", help="comma-separated stage names")
     s.add_argument("--task", help="explicit task key for one-monitor-per-task dedup (defaults to the title)")
-    s.add_argument("--lane", help="routing lane (e.g. before_freedom) -> which bot/chat the bubble is sent through; defaults to HERMES_MONITOR_LANE or 'default'")
+    s.add_argument("--lane", help="Telegram routing lane; defaults to HERMES_MONITOR_LANE or 'default'")
+    s.add_argument("--transport", choices=["telegram", "whatsapp"], help="delivery transport; defaults to HERMES_TASK_MONITOR_TRANSPORT or telegram")
     s.add_argument("--force", action="store_true", help="always create a new monitor even if one is live for this task")
     s.set_defaults(func=cmd_start)
 
@@ -843,7 +997,8 @@ def main():
     s.add_argument("title", nargs="?", default="Task")
     s.add_argument("--stages", help="comma-separated stage names")
     s.add_argument("--task", help="explicit task key for one-monitor-per-task dedup (defaults to the title)")
-    s.add_argument("--lane", help="routing lane (e.g. before_freedom) -> which bot/chat the bubble is sent through; defaults to HERMES_MONITOR_LANE or 'default'")
+    s.add_argument("--lane", help="Telegram routing lane; defaults to HERMES_MONITOR_LANE or 'default'")
+    s.add_argument("--transport", choices=["telegram", "whatsapp"], help="delivery transport; defaults to HERMES_TASK_MONITOR_TRANSPORT or telegram")
     s.add_argument("--force", action="store_true", help="always create a new monitor even if one is live for this task")
     s.set_defaults(func=cmd_start)
 

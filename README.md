@@ -1,6 +1,6 @@
 # task-monitor-agent
 
-Local Telegram progress monitor for agent workflows. It creates one Telegram message per task and edits that message as stages move from pending to active to done or failed.
+Local Telegram and WhatsApp progress monitor for agent workflows. It creates one message per task and edits that message as stages move from pending to active to done or failed.
 
 It is useful for long builds, renders, deploys, multi-agent workflows, research passes, and production runs where the user should not stare at a silent terminal.
 
@@ -25,6 +25,14 @@ cp .env.example ~/.openclaw/.env
 
 Edit `~/.openclaw/.env` with the user's own Telegram bot token and chat ID.
 
+For a local Hermes WhatsApp bridge, select WhatsApp per task:
+
+```bash
+ID=$(task-monitor start "Publish repos" --transport whatsapp --stages "Audit,Package,Test,Push,Verify")
+```
+
+Configure `HERMES_WHATSAPP_CHAT_ID` (or `WHATSAPP_HOME_CHANNEL`) and, when the bridge is not on port 3000, `HERMES_WHATSAPP_BRIDGE_URL`. Set `HERMES_TASK_MONITOR_TRANSPORT=whatsapp` to make WhatsApp the default. WhatsApp edits expire after roughly 15 minutes, so the monitor automatically finalizes the current card and continues in a fresh card before the edit window closes.
+
 ## Usage
 
 ```bash
@@ -44,7 +52,7 @@ task-monitor show "$ID"
 
 ## Environment
 
-The monitor reads credentials from `~/.openclaw/.env` and then from process env.
+The monitor reads configuration from `~/.openclaw/.env`, `~/.hermes/.env`, and process env.
 
 Preferred variables:
 
@@ -63,6 +71,10 @@ Optional:
 - `HERMES_MONITOR_LANE=default`
 - `HERMES_TASK_MONITOR_DISABLED=true`
 - `HERMES_TASK_MONITOR_FORCE_ENABLE=true`
+- `HERMES_TASK_MONITOR_TRANSPORT=telegram|whatsapp`
+- `HERMES_WHATSAPP_CHAT_ID=...`
+- `HERMES_WHATSAPP_BRIDGE_URL=http://127.0.0.1:3000`
+- `HERMES_TASK_MONITOR_WHATSAPP_ROLLOVER=840`
 
 ## Agent Skill
 
@@ -82,7 +94,7 @@ Runtime monitor state is stored locally at:
 ~/.openclaw/task-monitors/
 ```
 
-Do not commit this folder. It contains live task state, Telegram message IDs, and local operational history.
+Do not commit this folder. It contains live task state, message IDs, and local operational history.
 
 ## Agent Quick Start
 
@@ -101,6 +113,6 @@ Then the user fills in their own Telegram credentials. Agents should launch a mo
 
 ## Safety
 
-- Do not commit `.env*`, monitor JSON state, locks, logs, or Telegram credentials.
+- Do not commit `.env*`, monitor JSON state, locks, logs, or transport credentials.
 - Never mark a stage `done` until the underlying work is actually verified.
-- If Telegram is rate-limited or unavailable, continue the work and report that the visibility layer failed.
+- If the selected transport is rate-limited or unavailable, continue the work and report that the visibility layer failed.
