@@ -8,6 +8,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -163,6 +164,140 @@ class WhatsAppTransportTests(unittest.TestCase):
         self.assertEqual(saved["result"], "success")
         self.assertTrue(saved["closed"])
         self.assertIn("released", BridgeHandler.calls[-1][1]["message"])
+
+
+class StageProgressTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.original_state_dir = tm.STATE_DIR
+        tm.STATE_DIR = Path(self.temp.name) / "state"
+        self.addCleanup(lambda: setattr(tm, "STATE_DIR", self.original_state_dir))
+
+    @staticmethod
+    def stages(*pairs):
+        return [
+            {"name": name, "status": status, "details": []}
+            for name, status in pairs
+        ]
+
+    def test_entering_planned_stage_settles_earlier_pending_rows(self):
+        stages = self.stages(
+            ("Prep", "done"),
+            ("Build", "pending"),
+            ("QA", "pending"),
+            ("Deliver", "pending"),
+        )
+        target = stages[2]
+        target["status"] = "active"
+
+        tm.reconcile_sequential_progress(stages, target, "active")
+
+        self.assertEqual(
+            [stage["status"] for stage in stages],
+            ["done", "done", "active", "pending"],
+        )
+
+    def test_dynamic_repair_stage_does_not_complete_planned_future_rows(self):
+        stages = self.stages(
+            ("Build", "active"),
+            ("Repair", "active"),
+            ("QA", "pending"),
+            ("Deliver", "pending"),
+        )
+        target = stages[1]
+
+        tm.reconcile_sequential_progress(
+            stages, target, "active", target_was_planned=False
+        )
+
+        self.assertEqual(
+            [stage["status"] for stage in stages],
+            ["done", "active", "pending", "pending"],
+        )
+
+    def test_unknown_active_stage_is_inserted_before_first_pending_row(self):
+        state = {
+            "id": "tm_stage_test",
+            "closed": False,
+            "stages": self.stages(
+                ("Audit", "done"),
+                ("QA", "pending"),
+                ("Deliver", "pending"),
+            ),
+        }
+        args = SimpleNamespace(
+            id="tm_stage_test",
+            name="Motion_Repair",
+            status="active",
+            detail="repairing motion",
+        )
+        with patch.object(tm, "load_monitor_env", return_value={}), \
+             patch.object(tm, "load_state", return_value=state), \
+             patch.object(tm, "push_update"):
+            tm.cmd_stage(args)
+
+        self.assertEqual(
+            [stage["name"] for stage in state["stages"]],
+            ["Audit", "Motion_Repair", "QA", "Deliver"],
+        )
+        self.assertEqual(
+            [stage["status"] for stage in state["stages"]],
+            ["done", "active", "pending", "pending"],
+        )
+
+    def test_successful_finish_clears_all_remaining_hourglasses(self):
+        state = {
+            "id": "tm_finish_test",
+            "closed": False,
+            "stages": self.stages(
+                ("Prep", "done"),
+                ("Build", "active"),
+                ("QA", "pending"),
+                ("Deliver", "pending"),
+            ),
+            "lanes": self.stages(("Worker", "pending")),
+            "ticker_pid": None,
+        }
+        args = SimpleNamespace(
+            id="tm_finish_test", success=True, fail=False, summary="complete"
+        )
+        with patch.object(tm, "load_monitor_env", return_value={}), \
+             patch.object(tm, "load_state", return_value=state), \
+             patch.object(tm, "stop_ticker"), \
+             patch.object(tm, "push_update"):
+            tm.cmd_finish(args)
+
+        self.assertTrue(state["closed"])
+        self.assertEqual(state["result"], "success")
+        self.assertTrue(all(s["status"] == "done" for s in state["stages"]))
+        self.assertTrue(all(l["status"] == "done" for l in state["lanes"]))
+
+    def test_failed_finish_marks_unsettled_rows_failed(self):
+        state = {
+            "id": "tm_fail_test",
+            "closed": False,
+            "stages": self.stages(
+                ("Prep", "done"),
+                ("Build", "active"),
+                ("QA", "pending"),
+            ),
+            "lanes": [],
+            "ticker_pid": None,
+        }
+        args = SimpleNamespace(
+            id="tm_fail_test", success=False, fail=True, summary="blocked"
+        )
+        with patch.object(tm, "load_monitor_env", return_value={}), \
+             patch.object(tm, "load_state", return_value=state), \
+             patch.object(tm, "stop_ticker"), \
+             patch.object(tm, "push_update"):
+            tm.cmd_finish(args)
+
+        self.assertEqual(
+            [stage["status"] for stage in state["stages"]],
+            ["done", "failed", "failed"],
+        )
 
 
 if __name__ == "__main__":

@@ -285,12 +285,18 @@ def load_monitor_env(monitor_id):
 
 
 def normalize_stages(stages):
-    """Migrate old-format stages (single `detail` string) to new (`details` list)."""
+    """Migrate old-format stages (single `detail` string) to new (`details` list).
+
+    Pre-metadata monitors default to unplanned so an old dynamically-added repair
+    row never settles unrelated future stages. New monitors mark their original
+    stage rows as planned at creation time.
+    """
     for stg in stages:
         if "details" not in stg:
             old = stg.get("detail")
             stg["details"] = [old] if old else []
         stg.pop("detail", None)
+        stg.setdefault("planned", False)
         # cap history
         if len(stg["details"]) > MAX_DETAILS_PER_STAGE:
             stg["details"] = stg["details"][-MAX_DETAILS_PER_STAGE:]
@@ -771,7 +777,10 @@ def cmd_start(args):
         "task_key": task_key,
         "title": title,
         "started_at": time.time(),
-        "stages": [{"name": s, "status": "pending", "details": []} for s in stages],
+        "stages": [
+            {"name": s, "status": "pending", "details": [], "planned": True}
+            for s in stages
+        ],
         "lanes": [],
         "notes": [],
         "closed": False,
@@ -805,6 +814,33 @@ def cmd_start(args):
     print(monitor_id)
 
 
+def reconcile_sequential_progress(stages, target, status, target_was_planned=True):
+    """Keep a sequential stage list monotonic.
+
+    Entering or completing a planned stage proves every earlier planned pending
+    stage has been passed, so settle those rows instead of leaving stale
+    hourglasses until finish. Parallel work belongs in `lane` rows and is not
+    touched here. Dynamically-added repair stages do not settle planned future
+    stages because they were not part of the original sequence.
+    """
+    if status not in ("active", "done"):
+        return
+
+    if status == "active":
+        for stg in stages:
+            if stg is not target and stg["status"] == "active":
+                stg["status"] = "done"
+
+    if not target_was_planned:
+        return
+
+    for stg in stages:
+        if stg is target:
+            break
+        if stg["status"] == "pending":
+            stg["status"] = "done"
+
+
 def cmd_stage(args):
     config = load_monitor_env(args.id)
     status = args.status
@@ -821,9 +857,21 @@ def cmd_stage(args):
             if stg["name"].lower() == name.lower():
                 found = stg
                 break
+        target_was_planned = bool(found and found.get("planned"))
         if not found:
-            found = {"name": name, "status": "pending", "details": []}
-            state["stages"].append(found)
+            found = {
+                "name": name,
+                "status": "pending",
+                "details": [],
+                "planned": False,
+            }
+            # Put an unplanned repair/current step before the first pending row,
+            # not after Deliver, so the card reads in execution order.
+            insert_at = next(
+                (i for i, stg in enumerate(state["stages"]) if stg["status"] == "pending"),
+                len(state["stages"]),
+            )
+            state["stages"].insert(insert_at, found)
 
         found["status"] = status
         if args.detail:
@@ -831,11 +879,9 @@ def cmd_stage(args):
             if len(found["details"]) > MAX_DETAILS_PER_STAGE:
                 found["details"] = found["details"][-MAX_DETAILS_PER_STAGE:]
 
-        # When marking active, auto-close any previously-active stage
-        if status == "active":
-            for stg in state["stages"]:
-                if stg is not found and stg["status"] == "active":
-                    stg["status"] = "done"
+        reconcile_sequential_progress(
+            state["stages"], found, status, target_was_planned=target_was_planned
+        )
 
         push_update(state, config)
 
@@ -957,14 +1003,17 @@ def cmd_finish(args):
         for stg in state["stages"]:
             if stg["status"] == "active":
                 stg["status"] = "done" if result == "success" else "failed"
-            if stg["status"] == "pending" and result == "failed":
-                stg["status"] = "failed"
+            elif stg["status"] == "pending":
+                # A successful close means the workflow completed. Do not leave
+                # stale hourglasses on the final card when callers omitted an
+                # explicit transition. Failed closes keep fail-closed semantics.
+                stg["status"] = "done" if result == "success" else "failed"
 
         for lane in state.get("lanes", []):
             if lane["status"] == "active":
                 lane["status"] = "done" if result == "success" else "failed"
-            if lane["status"] == "pending" and result == "failed":
-                lane["status"] = "failed"
+            elif lane["status"] == "pending":
+                lane["status"] = "done" if result == "success" else "failed"
 
         push_update(state, config)
 

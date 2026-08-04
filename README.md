@@ -50,6 +50,10 @@ Show the current rendered monitor text:
 task-monitor show "$ID"
 ```
 
+### Stage progression
+
+Planned stages are sequential. When a later planned stage becomes `active` or `done`, earlier pending stages settle to `done`, preventing stale hourglasses during the job. Unplanned repair stages appear before the next pending planned stage without completing future work. A successful `finish` settles all remaining rows; a failed `finish` marks unfinished rows failed. Use `lane` rows for parallel workers.
+
 ## Environment
 
 The monitor reads configuration from `~/.openclaw/.env`, `~/.hermes/.env`, and process env.

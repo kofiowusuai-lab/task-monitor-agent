@@ -47,6 +47,8 @@ task-monitor finish "$ID" --fail --summary "blocked by missing credentials"
 
 `pending` | `active` | `done` | `failed`
 
+Sequential stages advance monotonically. Activating or completing a planned stage settles any earlier pending planned stages. Dynamically added repair stages are inserted before the next pending planned stage and do not complete future work. A successful `finish` clears any remaining hourglasses; a failed `finish` marks unfinished rows failed. Parallel work belongs in `lane` rows.
+
 ## Discipline
 
 - A stage is `done` only after the external check is complete.
