@@ -65,6 +65,20 @@ HERMES_ENV_FILE = Path.home() / ".hermes" / ".env"
 DEFAULT_LANE = "default"
 DEFAULT_TRANSPORT = "telegram"
 DEFAULT_WHATSAPP_BRIDGE_URL = "http://127.0.0.1:3000"
+
+# High-frequency inbox polling is background infrastructure, not a user-visible
+# task. Claude's session scheduler can launch the same empty Recorrido support
+# check under several titles. Keep a local monitor record for execution-law and
+# debugging purposes, but never send or tick a Telegram/WhatsApp card for these
+# routine polls. Real support incidents and replies use different task names and
+# remain visible.
+_SILENT_POLL_TASK_KEYS = {
+    "process recorrido support inbox",
+    "process recorrido support email",
+    "process recorrido support queue",
+    "recorrido support inbox processing",
+    "recorrido support inbox sync",
+}
 try:
     WHATSAPP_ROLLOVER_SECONDS = max(
         30.0,
@@ -127,6 +141,10 @@ def resolve_lane(explicit=None):
     A lane decides which bot/chat the bubble is sent through (see lane_route)."""
     lane = (explicit or os.environ.get("HERMES_MONITOR_LANE") or DEFAULT_LANE).strip()
     return lane or DEFAULT_LANE
+
+
+def is_silent_poll_task(task_key):
+    return (task_key or "").strip().lower() in _SILENT_POLL_TASK_KEYS
 
 
 # Title markers that route obvious UGC/video monitor titles to a dedicated lane
@@ -598,6 +616,10 @@ def push_update(state, config):
     finish) — never the cosmetic ticker — so this marks REAL progress: stamp
     last_progress_ts so footer_status knows the work is still moving."""
     state["last_progress_ts"] = time.time()
+    if state.get("silent"):
+        state["last_edit_ts"] = time.time()
+        save_state(state)
+        return
     now = time.time()
     last = state.get("last_edit_ts", 0)
     if not state.get("closed") and (now - last) < MIN_EDIT_INTERVAL:
@@ -686,6 +708,8 @@ def cmd_tick(args):
             if not p.exists():
                 return
             state = json.loads(p.read_text())
+            if state.get("silent"):
+                return
             normalize_stages(state.get("stages", []))
             state.setdefault("lanes", [])
             normalize_lanes(state["lanes"])
@@ -794,6 +818,11 @@ def cmd_start(args):
         "last_progress_ts": time.time(),
         "ticker_pid": None,
     }
+    if is_silent_poll_task(task_key):
+        state["silent"] = True
+        save_state(state)
+        print(monitor_id)
+        return
     text = render(state)
     resp = send_message(config, text)
     if not resp.get("ok"):
