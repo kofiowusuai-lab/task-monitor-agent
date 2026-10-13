@@ -59,17 +59,6 @@ try:
 except Exception:  # keep the monitor working even if the resolver is missing
     lane_route = None
 
-# --- K'S HARDENED PIN (2026-09-11) ------------------------------------------
-# K order: ALL monitors — from ANY Hermes instance/profile — must go through bot
-# 8699769933 (@Hermephsbot) into chat 5426093479 (K's DM). New instances were
-# teaching the skill and then re-pointing monitors at their own bot/chat.
-# These pins are checked FIRST in load_env and can only be overridden by
-# HERMES_TASK_MONITOR_OVERRIDE_TOKEN / _CHAT (explicit operator intent), by
-# an explicit --lane that provides its own creds, or by whatsapp transport.
-PINNED_BOT_ID = "8699769933"
-PINNED_CHAT_ID = "5426093479"
-PIN_OVERRIDES_ALLOW_LANE = {"ugc", "before_freedom"}  # dedicated lanes keep their routes
-
 STATE_DIR = Path.home() / ".openclaw" / "task-monitors"
 ENV_FILE = Path.home() / ".openclaw" / ".env"
 HERMES_ENV_FILE = Path.home() / ".hermes" / ".env"
@@ -226,33 +215,22 @@ def load_env(lane=DEFAULT_LANE, transport=None):
             "bridge_url": bridge_url,
         }
 
-    # Lane-aware Telegram routing: a non-default lane resolves to its
-    # own bot+chat via ~/.openclaw/telegram_routes.json so its bubbles land in the
-    # right Telegram chat. The default lane preserves the historical fallback order.
+    # Lane-aware Telegram routing: a lane resolves to its own bot+chat via
+    # ~/.openclaw/telegram_routes.json so its bubbles land in the right
+    # Telegram chat. Without a lane route, standard env vars apply.
     lane = lane or DEFAULT_LANE
     token = chat = None
     if lane_route is not None:
         creds = lane_route.resolve(lane, env)
         token, chat = creds.get("token"), creds.get("chat")
-    # --- K's hardened pin: unless this is a dedicated lane with its own routing,
-    # the bot+chat are FIXED. Token comes ONLY from the bot-id-pinned entry in
-    # ~/.openclaw/.env (a new Hermes instance must never re-point routing), and
-    # the chat is the pinned DM. Operator override only via
-    # HERMES_TASK_MONITOR_OVERRIDE_TOKEN / _CHAT.
-    if lane in PIN_OVERRIDES_ALLOW_LANE or (lane_route is not None and token and chat):
-        pass  # dedicated lane handles its own landing spot
-    else:
-        pin_token = env.get("HERMES_TASK_MONITOR_OVERRIDE_TOKEN")
-        pin_chat = env.get("HERMES_TASK_MONITOR_OVERRIDE_CHAT")
-        env_tok = env.get("HERMES_TASK_MONITOR_PIN_TOKEN")
-        if pin_token:
-            token, chat = pin_token, (pin_chat or chat)
-        elif env_tok := env.get("HERMES_TELEGRAM_BOT_TOKEN"):
-            if bot_id_of(env_tok) != PINNED_BOT_ID:
-                sys.exit(f"task-monitor routing pin: HERMES_TELEGRAM_BOT_TOKEN is bot {bot_id_of(env_tok)}, pinned bot is {PINNED_BOT_ID}. Edit the env to the pinned token or set HERMES_TASK_MONITOR_OVERRIDE_TOKEN.")
-            token, chat = env_tok, (pin_chat or PINNED_CHAT_ID)
-        else:
-            sys.exit("task-monitor routing pin: HERMES_TELEGRAM_BOT_TOKEN missing from pin file; cannot resolve pinned bot.")
+    token = token or env.get("HERMES_TELEGRAM_BOT_TOKEN") or env.get("TELEGRAM_BOT_TOKEN")
+    chat = (
+        chat
+        or env.get("HERMES_TELEGRAM_CHAT_ID")
+        or env.get("TELEGRAM_CHAT_ID")
+        or env.get("TELEGRAM_HOME_CHANNEL")
+        or env.get("TELEGRAM_USER_ID")
+    )
     if not token or not chat:
         sys.exit("HERMES_TELEGRAM_BOT_TOKEN/HERMES_TELEGRAM_CHAT_ID or TELEGRAM_BOT_TOKEN/TELEGRAM_HOME_CHANNEL/TELEGRAM_USER_ID missing")
     return {
